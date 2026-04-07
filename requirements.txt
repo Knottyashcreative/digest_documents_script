@@ -12,3 +12,7 @@ pytesseract>=0.3.10
 
 # DOCX fallback when MarkItDown unavailable
 python-docx>=1.1.0
+
+# PPTX/XLSX fallbacks when MarkItDown unavailable
+python-pptx>=1.0.2
+openpyxl>=3.1.2

@@ -45,7 +45,9 @@ python obsidian_pro_master.py --config config.json --doctor
 | `.docx` | **MarkItDown** | Fallback: **python-docx** if MarkItDown missing |
 | `.json`, `.csv`, `.xml` | stdlib parse → markdown | No MarkItDown required |
 | `.html`, `.htm` | stdlib tag-strip → text | Readability fallback (not full HTML→MD) |
-| Other office formats (`.pptx`, `.xlsx`, `.doc`) | **MarkItDown** | Requires `markitdown` installed |
+| `.pptx` | **MarkItDown** | Fallback: **python-pptx** if MarkItDown missing |
+| `.xlsx` | **MarkItDown** | Fallback: **openpyxl** if MarkItDown missing |
+| `.doc` | **MarkItDown** | No fallback provided (legacy format) |
 
 YAML field **`content_source`** records the winning path, e.g. `markitdown`, `pymupdf`, `markitdown+pymupdf`, `ocr_pdf`, `ocr_image`, `utf8_plain`, `image_embed`.
 
@@ -80,6 +82,45 @@ If you want OCR to be “required” (rather than best-effort), set `fail_if_ocr
 ## Operational files
 
 - `process_log.json`, `error_log.csv` (paths from `system_settings`)
+
+## Step-by-step: convert an entire folder (including subfolders)
+
+1) Create venv and install deps (once):
+
+```bash
+cd /path/to/digest_documents_script
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+2) (Optional but recommended) Preflight your environment:
+
+```bash
+python obsidian_pro_master.py --config config.json --doctor
+```
+
+3) Convert everything under a folder recursively:
+
+```bash
+python obsidian_pro_master.py \
+  --config config.json \
+  --input "/path/to/source_folder" \
+  --output "/path/to/obsidian_output_folder" \
+  --recursive
+```
+
+4) Re-run to only process new/changed files (default behavior uses SHA-256 log):
+
+```bash
+python obsidian_pro_master.py --config config.json --input "/path/to/source_folder" --output "/path/to/obsidian_output_folder" --recursive
+```
+
+5) Force reprocess everything (ignores `process_log.json`):
+
+```bash
+python obsidian_pro_master.py --config config.json --input "/path/to/source_folder" --output "/path/to/obsidian_output_folder" --recursive --no-skip
+```
 
 ## Honest limitations (“no flaws” is not guaranteed)
 

@@ -59,6 +59,16 @@ try:
 except ImportError:
     docx = None  # type: ignore
 
+try:
+    import pptx  # python-pptx
+except ImportError:
+    pptx = None  # type: ignore
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -209,6 +219,8 @@ def doctor_report(cfg: dict[str, Any]) -> tuple[int, str]:
     row("MarkItDown", MarkItDown is not None, "pip install markitdown")
     row("PyMuPDF", fitz is not None, "pip install pymupdf")
     row("python-docx", docx is not None, "pip install python-docx")
+    row("python-pptx", pptx is not None, "pip install python-pptx")
+    row("openpyxl", openpyxl is not None, "pip install openpyxl")
     row("pytesseract", pytesseract is not None, "pip install pytesseract")
     row("Pillow", Image is not None, "pip install Pillow")
     row("tesseract binary", tesseract_is_available(), "install tesseract-ocr on OS and ensure on PATH")
@@ -592,6 +604,74 @@ class ObsidianMasterEngine:
             md.append("| " + " | ".join(r) + " |")
         return "\n".join(md) + "\n", warnings
 
+    def _xlsx_fallback(self, path: Path, max_rows: int = 200) -> tuple[str, list[str]]:
+        warnings: list[str] = []
+        if openpyxl is None:
+            raise RuntimeError("openpyxl not installed; pip install openpyxl (XLSX fallback)")
+        try:
+            wb = openpyxl.load_workbook(path_for_open(path), data_only=True, read_only=True)
+        except Exception as e:
+            raise RuntimeError(f"xlsx_open_failed: {e}") from e
+
+        try:
+            out: list[str] = []
+            for ws in wb.worksheets:
+                out.append(f"## Sheet: {ws.title}")
+                rows_out: list[list[str]] = []
+                for i, row in enumerate(ws.iter_rows(values_only=True)):
+                    if i >= max_rows:
+                        warnings.append(f"xlsx_truncated:{ws.title}: max_rows={max_rows}")
+                        break
+                    rows_out.append([("" if v is None else str(v)) for v in row])
+                if not rows_out:
+                    out.append("_Empty sheet_\n")
+                    continue
+                width = max(len(r) for r in rows_out)
+                for r in rows_out:
+                    if len(r) < width:
+                        r.extend([""] * (width - len(r)))
+                header = rows_out[0]
+                body = rows_out[1:] if len(rows_out) > 1 else []
+                out.append("| " + " | ".join(header) + " |")
+                out.append("| " + " | ".join(["---"] * width) + " |")
+                for r in body:
+                    out.append("| " + " | ".join(r) + " |")
+                out.append("")
+            return "\n".join(out).strip() + "\n", warnings
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+    def _pptx_fallback(self, path: Path) -> tuple[str, list[str]]:
+        warnings: list[str] = []
+        if pptx is None:
+            raise RuntimeError("python-pptx not installed; pip install python-pptx (PPTX fallback)")
+        try:
+            prs = pptx.Presentation(path_for_open(path))
+        except Exception as e:
+            raise RuntimeError(f"pptx_open_failed: {e}") from e
+
+        lines: list[str] = []
+        for i, slide in enumerate(prs.slides, start=1):
+            lines.append(f"## Slide {i}")
+            slide_texts: list[str] = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text:
+                    t = shape.text.strip()
+                    if t:
+                        slide_texts.append(t)
+            if slide_texts:
+                lines.extend(["- " + t.replace("\n", " ") for t in slide_texts])
+            else:
+                lines.append("_No text on slide_")
+            lines.append("")
+        out = "\n".join(lines).strip()
+        if not out:
+            warnings.append("pptx_empty")
+        return out + "\n", warnings
+
     def _html_fallback(self, path: Path) -> tuple[str, list[str]]:
         warnings: list[str] = []
         raw = path.read_text(encoding="utf-8", errors="replace")
@@ -672,6 +752,16 @@ class ObsidianMasterEngine:
             text, w = self._csv_fallback(path)
             warnings.extend(w)
             content_source = "stdlib_csv"
+
+        elif suffix == ".xlsx" and self._mid is None and not require_office:
+            text, w = self._xlsx_fallback(path)
+            warnings.extend(w)
+            content_source = "openpyxl"
+
+        elif suffix == ".pptx" and self._mid is None and not require_office:
+            text, w = self._pptx_fallback(path)
+            warnings.extend(w)
+            content_source = "python-pptx"
 
         elif suffix in {".html", ".htm"}:
             text, w = self._html_fallback(path)
@@ -769,6 +859,14 @@ class ObsidianMasterEngine:
                     text, w = self._docx_fallback(path)
                     warnings.extend(w)
                     content_source = "python-docx"
+                elif not require_office and suffix == ".xlsx":
+                    text, w = self._xlsx_fallback(path)
+                    warnings.extend(w)
+                    content_source = "openpyxl"
+                elif not require_office and suffix == ".pptx":
+                    text, w = self._pptx_fallback(path)
+                    warnings.extend(w)
+                    content_source = "python-pptx"
                 else:
                     raise RuntimeError(
                         "markitdown not installed; pip install markitdown "
