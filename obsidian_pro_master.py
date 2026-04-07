@@ -52,6 +52,11 @@ except ImportError:
     pytesseract = None  # type: ignore
     Image = None  # type: ignore
 
+try:
+    import docx  # python-docx
+except ImportError:
+    docx = None  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -105,6 +110,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pdf_cross_check_markitdown_vs_pymupdf": True,
         "ocr_comparison_threshold": 0.35,
         "prefer_longer_text_on_divergence": True,
+        "require_markitdown_for_office_formats": False,
+        "fail_if_ocr_enabled_but_unavailable": False,
         "callout_keywords": {},
     },
     "yaml_template": {
@@ -167,6 +174,60 @@ def file_sha256(filepath: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def tesseract_is_available() -> bool:
+    if pytesseract is None:
+        return False
+    try:
+        _ = pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+
+def doctor_report(cfg: dict[str, Any]) -> tuple[int, str]:
+    """
+    Return (exit_code, report_text).
+
+    exit_code:
+      0 = looks OK for common use
+      2 = missing dependency for requested features
+    """
+    pkm = cfg.get("pkm_settings", {})
+    want_ocr = bool(pkm.get("ocr_enabled", False))
+    fail_on_ocr = bool(pkm.get("fail_if_ocr_enabled_but_unavailable", False))
+    require_office = bool(pkm.get("require_markitdown_for_office_formats", False))
+
+    lines: list[str] = []
+
+    def row(name: str, ok: bool, fix: str = "") -> None:
+        lines.append(f"- {name}: {'OK' if ok else 'MISSING'}" + (f" ({fix})" if (fix and not ok) else ""))
+
+    row("MarkItDown", MarkItDown is not None, "pip install markitdown")
+    row("PyMuPDF", fitz is not None, "pip install pymupdf")
+    row("python-docx", docx is not None, "pip install python-docx")
+    row("pytesseract", pytesseract is not None, "pip install pytesseract")
+    row("Pillow", Image is not None, "pip install Pillow")
+    row("tesseract binary", tesseract_is_available(), "install tesseract-ocr on OS and ensure on PATH")
+
+    ok = True
+
+    if MarkItDown is None and fitz is None:
+        ok = False
+        lines.append("- PDF: neither MarkItDown nor PyMuPDF available; PDFs cannot be processed.")
+
+    if require_office and MarkItDown is None:
+        ok = False
+        lines.append("- Office formats: require_markitdown_for_office_formats=true but MarkItDown is missing.")
+
+    if want_ocr and not (pytesseract is not None and Image is not None and tesseract_is_available()):
+        if fail_on_ocr:
+            ok = False
+        lines.append("- OCR: enabled but dependencies incomplete; OCR will be skipped with warnings unless fail_if_ocr_enabled_but_unavailable=true.")
+
+    code = 0 if ok else 2
+    return code, "Doctor report:\n" + "\n".join(lines) + "\n"
 
 
 def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
@@ -472,6 +533,20 @@ class ObsidianMasterEngine:
             )
         return raw.strip(), warnings
 
+    def _docx_fallback(self, path: Path) -> tuple[str, list[str]]:
+        warnings: list[str] = []
+        if docx is None:
+            raise RuntimeError("python-docx not installed; pip install python-docx (DOCX fallback)")
+        try:
+            d = docx.Document(path_for_open(path))
+            paras = [(p.text or "").rstrip() for p in d.paragraphs]
+            text = "\n\n".join([p for p in paras if p.strip()]).strip()
+            if not text:
+                warnings.append("docx_empty: no paragraph text extracted")
+            return text, warnings
+        except Exception as e:
+            raise RuntimeError(f"docx_fallback_failed: {e}") from e
+
     def convert_document(self, path: Path) -> tuple[str, list[str], str]:
         """Return (markdown_body, warnings, content_source)."""
         pkm = self.config.get("pkm_settings", {})
@@ -489,6 +564,14 @@ class ObsidianMasterEngine:
         prefer_longer = bool(pkm.get("prefer_longer_text_on_divergence", True))
         pdf_pm = bool(pkm.get("pdf_pymupdf_text_fallback", True))
         cross = bool(pkm.get("pdf_cross_check_markitdown_vs_pymupdf", True))
+        require_office = bool(pkm.get("require_markitdown_for_office_formats", False))
+        fail_on_ocr_missing = bool(pkm.get("fail_if_ocr_enabled_but_unavailable", False))
+
+        if ocr_on and fail_on_ocr_missing and not (pytesseract is not None and Image is not None and tesseract_is_available()):
+            raise RuntimeError(
+                "ocr_enabled=true but OCR dependencies are missing. "
+                "Install Pillow + pytesseract + OS tesseract-ocr, or set fail_if_ocr_enabled_but_unavailable=false."
+            )
 
         text = ""
         content_source = "unknown"
@@ -497,6 +580,12 @@ class ObsidianMasterEngine:
             text, w = self._plain_text_fallback(path)
             warnings.extend(w)
             content_source = "utf8_plain"
+
+        elif suffix == ".docx" and self._mid is None:
+            # Fallback when MarkItDown is unavailable
+            text, w = self._docx_fallback(path)
+            warnings.extend(w)
+            content_source = "python-docx"
 
         elif suffix in IMAGE_EXTENSIONS:
             content_source = "image_embed"
@@ -574,16 +663,23 @@ class ObsidianMasterEngine:
 
         else:
             if self._mid is None:
-                raise RuntimeError(
-                    "markitdown not installed; pip install markitdown "
-                    f"(required for {suffix})"
-                )
+                if not require_office and suffix == ".docx":
+                    text, w = self._docx_fallback(path)
+                    warnings.extend(w)
+                    content_source = "python-docx"
+                else:
+                    raise RuntimeError(
+                        "markitdown not installed; pip install markitdown "
+                        f"(required for {suffix})"
+                    )
             try:
-                result = self._mid.convert(str(path))
-                text = (result.text_content or "").strip()
+                if self._mid is not None:
+                    result = self._mid.convert(str(path))
+                    text = (result.text_content or "").strip()
             except Exception as e:
                 raise RuntimeError(f"convert failed: {e}") from e
-            content_source = "markitdown"
+            if self._mid is not None:
+                content_source = "markitdown"
 
         if len(text) < low:
             warnings.append(
@@ -1087,6 +1183,7 @@ def main() -> None:
     ap.add_argument("--input", type=Path, help="Input folder (documents)")
     ap.add_argument("--output", type=Path, help="Obsidian vault output folder")
     ap.add_argument("--gui", action="store_true", help="Tkinter UI")
+    ap.add_argument("--doctor", action="store_true", help="Check dependencies and exit")
     ap.add_argument(
         "--no-skip",
         action="store_true",
@@ -1098,6 +1195,12 @@ def main() -> None:
         help="Include supported files in subfolders (rglob)",
     )
     args = ap.parse_args()
+
+    if args.doctor:
+        cfg = load_config(args.config)
+        code, rep = doctor_report(cfg)
+        print(rep)
+        raise SystemExit(code)
 
     if args.gui:
         run_gui(args.config)

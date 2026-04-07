@@ -27,7 +27,13 @@ python obsidian_pro_master.py --config config.json --input /path/to/input_dir --
 
 Optional GUI: `python obsidian_pro_master.py --config config.json --gui`
 
-CLI: `--no-skip`, `--recursive`
+CLI: `--no-skip`, `--recursive`, `--doctor`
+
+Preflight check (recommended):
+
+```bash
+python obsidian_pro_master.py --config config.json --doctor
+```
 
 ## Extraction pipeline (by type)
 
@@ -36,6 +42,7 @@ CLI: `--no-skip`, `--recursive`
 | `.md`, `.txt`, `.markdown` | UTF-8 read | If MarkItDown missing → still works; warning in YAML |
 | `.pdf` | Microsoft **MarkItDown** | **PyMuPDF** full-document text; if both yield substantial text, **length-ratio cross-check** (configurable); if still **low text** and `ocr_enabled` → **per-page OCR** (capped pages, DPI configurable) |
 | `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.tif`, `.bmp` | **OCR** (if `ocr_enabled` + `images_ocr`) | Else `![[filename]]` embed + note to enable OCR |
+| `.docx` | **MarkItDown** | Fallback: **python-docx** if MarkItDown missing |
 | Office / HTML / XML / CSV / JSON | **MarkItDown** | Requires `markitdown` installed |
 
 YAML field **`content_source`** records the winning path, e.g. `markitdown`, `pymupdf`, `markitdown+pymupdf`, `ocr_pdf`, `ocr_image`, `utf8_plain`, `image_embed`.
@@ -53,10 +60,14 @@ YAML field **`content_source`** records the winning path, e.g. `markitdown`, `py
 | `pdf_cross_check_markitdown_vs_pymupdf` | Emit **warning** if both extracts are long but **length ratio** &lt; threshold |
 | `ocr_comparison_threshold` | Ratio in \((0,1]\); below → `cross_check:` warning (not auto-failure) |
 | `prefer_longer_text_on_divergence` | When choosing between MarkItDown vs PyMuPDF text, prefer the longer |
+| `require_markitdown_for_office_formats` | If true, `.docx` and other office formats hard-require MarkItDown |
+| `fail_if_ocr_enabled_but_unavailable` | If true, treat missing OCR deps as a hard error (fail fast) |
 
 ## System dependencies (OCR)
 
 Python packages alone are **not** enough: **Tesseract** must be installed and on `PATH` (so `pytesseract` can invoke it). Without it, OCR steps produce warnings and fall back to embeds or native PDF text only.
+
+If you want OCR to be “required” (rather than best-effort), set `fail_if_ocr_enabled_but_unavailable=true` and use `--doctor` in your wrapper/CI.
 
 ## Outputs per source file
 
