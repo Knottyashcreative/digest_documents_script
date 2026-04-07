@@ -43,7 +43,9 @@ python obsidian_pro_master.py --config config.json --doctor
 | `.pdf` | Microsoft **MarkItDown** | **PyMuPDF** full-document text; if both yield substantial text, **length-ratio cross-check** (configurable); if still **low text** and `ocr_enabled` → **per-page OCR** (capped pages, DPI configurable) |
 | `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.tif`, `.bmp` | **OCR** (if `ocr_enabled` + `images_ocr`) | Else `![[filename]]` embed + note to enable OCR |
 | `.docx` | **MarkItDown** | Fallback: **python-docx** if MarkItDown missing |
-| Office / HTML / XML / CSV / JSON | **MarkItDown** | Requires `markitdown` installed |
+| `.json`, `.csv`, `.xml` | stdlib parse → markdown | No MarkItDown required |
+| `.html`, `.htm` | stdlib tag-strip → text | Readability fallback (not full HTML→MD) |
+| Other office formats (`.pptx`, `.xlsx`, `.doc`) | **MarkItDown** | Requires `markitdown` installed |
 
 YAML field **`content_source`** records the winning path, e.g. `markitdown`, `pymupdf`, `markitdown+pymupdf`, `ocr_pdf`, `ocr_image`, `utf8_plain`, `image_embed`.
 

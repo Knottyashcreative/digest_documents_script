@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from dataclasses import dataclass, field
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 import yaml
 
@@ -547,6 +549,86 @@ class ObsidianMasterEngine:
         except Exception as e:
             raise RuntimeError(f"docx_fallback_failed: {e}") from e
 
+    def _json_fallback(self, path: Path) -> tuple[str, list[str]]:
+        warnings: list[str] = []
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            return "```json\n" + json.dumps(obj, indent=2, ensure_ascii=False) + "\n```\n", warnings
+        except Exception as e:
+            warnings.append(f"json_parse_failed: {e}")
+            raw = path.read_text(encoding="utf-8", errors="replace")
+            return "```text\n" + raw + "\n```\n", warnings
+
+    def _csv_fallback(self, path: Path, max_rows: int = 200) -> tuple[str, list[str]]:
+        warnings: list[str] = []
+        try:
+            with open(path_for_open(path), newline="", encoding="utf-8", errors="replace") as f:
+                reader = csv.reader(f)
+                rows: list[list[str]] = []
+                for i, row in enumerate(reader):
+                    if i >= max_rows:
+                        warnings.append(f"csv_truncated: max_rows={max_rows}")
+                        break
+                    rows.append([c.strip() for c in row])
+        except Exception as e:
+            raise RuntimeError(f"csv_read_failed: {e}") from e
+
+        if not rows:
+            warnings.append("csv_empty")
+            return "", warnings
+
+        # Normalize to rectangular
+        width = max(len(r) for r in rows)
+        for r in rows:
+            if len(r) < width:
+                r.extend([""] * (width - len(r)))
+
+        header = rows[0]
+        body = rows[1:] if len(rows) > 1 else []
+        md = []
+        md.append("| " + " | ".join(header) + " |")
+        md.append("| " + " | ".join(["---"] * width) + " |")
+        for r in body:
+            md.append("| " + " | ".join(r) + " |")
+        return "\n".join(md) + "\n", warnings
+
+    def _html_fallback(self, path: Path) -> tuple[str, list[str]]:
+        warnings: list[str] = []
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        # Extremely small, safe fallback: strip tags to text blocks.
+        # This is not a full HTML→Markdown converter; it is a readability fallback.
+        text = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", "", raw)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = html.unescape(text)
+        text = re.sub(r"[ \\t]+", " ", text)
+        text = re.sub(r"\\n\\s*\\n\\s*\\n+", "\\n\\n", text)
+        return text.strip(), warnings
+
+    def _xml_fallback(self, path: Path) -> tuple[str, list[str]]:
+        warnings: list[str] = []
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        try:
+            root = ElementTree.fromstring(raw)
+        except Exception as e:
+            warnings.append(f"xml_parse_failed: {e}")
+            return "```xml\n" + raw + "\n```\n", warnings
+
+        def walk(el: ElementTree.Element, depth: int = 0, out: list[str] | None = None) -> list[str]:
+            if out is None:
+                out = []
+            indent = "  " * depth
+            attrs = " ".join([f'{k}=\"{v}\"' for k, v in el.attrib.items()])
+            line = f"{indent}- <{el.tag}" + (f" {attrs}" if attrs else "") + ">"
+            out.append(line)
+            if el.text and el.text.strip():
+                out.append(f"{indent}  {el.text.strip()}")
+            for ch in list(el):
+                walk(ch, depth + 1, out)
+            return out
+
+        lines = walk(root)
+        return "\n".join(lines).strip() + "\n", warnings
+
     def convert_document(self, path: Path) -> tuple[str, list[str], str]:
         """Return (markdown_body, warnings, content_source)."""
         pkm = self.config.get("pkm_settings", {})
@@ -580,6 +662,26 @@ class ObsidianMasterEngine:
             text, w = self._plain_text_fallback(path)
             warnings.extend(w)
             content_source = "utf8_plain"
+
+        elif suffix == ".json":
+            text, w = self._json_fallback(path)
+            warnings.extend(w)
+            content_source = "stdlib_json"
+
+        elif suffix == ".csv":
+            text, w = self._csv_fallback(path)
+            warnings.extend(w)
+            content_source = "stdlib_csv"
+
+        elif suffix in {".html", ".htm"}:
+            text, w = self._html_fallback(path)
+            warnings.extend(w)
+            content_source = "stdlib_html_text"
+
+        elif suffix == ".xml":
+            text, w = self._xml_fallback(path)
+            warnings.extend(w)
+            content_source = "stdlib_xml"
 
         elif suffix == ".docx" and self._mid is None:
             # Fallback when MarkItDown is unavailable

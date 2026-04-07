@@ -46,6 +46,8 @@
     "pdf_cross_check_markitdown_vs_pymupdf": true,
     "ocr_comparison_threshold": 0.35,
     "prefer_longer_text_on_divergence": true,
+    "require_markitdown_for_office_formats": false,
+    "fail_if_ocr_enabled_but_unavailable": false,
     "callout_keywords": {
       "Note": "[!INFO]",
       "Important": "[!IMPORTANT]",
