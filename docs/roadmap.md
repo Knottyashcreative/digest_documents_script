@@ -4,7 +4,7 @@ Purpose: Keep the project focused. This file defines the MVP (Phase 1) and expli
 
 ## Milestone M1 (repository / GitHub)
 
-**Shipped in repo:** docs skeleton (`docs/README.md` and linked pages), `docs/AGENTS.md`, ADR folder + template, ingestion engine `obsidian_pro_master.py` + `config.json` + `requirements.txt`, runbook `docs/document-ingestion-engine.md`, sample input `fixtures/in/`.
+**Shipped in repo:** docs skeleton, ADRs (incl. embedding lock), ingestion `obsidian_pro_master.py`, **cache contracts** (`docs/contracts/cache-note-schema-v1.md`, `redis-vector-metadata-v1.md`), **validator** `scripts/validate_llm_cache.py`, **runbooks** (rebuild / reconcile), **MCP setup** doc, `docker-compose.example.yml`, `.env.example`, `n8n/README.md`, sample `fixtures/in/`.
 
 **Branching:** work on `main`; tag releases optionally as `m1-docs-ingestion` after CI or manual smoke test.
 

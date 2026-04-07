@@ -12,6 +12,7 @@ Purpose: Capture lightweight threat notes, trust boundaries, and security expect
 - TODO: List the “entry points” (APIs, jobs, webhooks, CLIs, admin tools, etc.).
 
 ## Secrets management
+- Example env template for local compose: **`.env.example`** at repo root (copy to `.env`, never commit secrets).
 - TODO: Where secrets are stored (conceptually) and how they’re accessed locally vs in production.
 - TODO: Rotation expectations and ownership.
 - TODO: Rules: never commit secrets; how to handle leaked secrets.

@@ -28,3 +28,7 @@ Write an ADR when you:
 ## Template
 Use `template.md`. Copy it to a new `NNNN-...` file and fill it in.
 
+## Index
+- [0001-record-architecture-decisions.md](0001-record-architecture-decisions.md) — use ADRs
+- [0002-embedding-model-phase1-lock.md](0002-embedding-model-phase1-lock.md) — Phase 1 embedding model lock
+

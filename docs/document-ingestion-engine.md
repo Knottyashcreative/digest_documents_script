@@ -1,12 +1,12 @@
 # Document ingestion engine (Phase output)
 
-Purpose: This repository’s **deliverable script** converts arbitrary supported documents into **preformatted Obsidian Markdown** with YAML frontmatter, optional chapter splitting, spindle navigation, and integrity metadata.
+Purpose: Convert **multiple document and image formats** into **Obsidian-ready Markdown** with YAML frontmatter, optional chapter splitting, spindle navigation, integrity metadata, **PDF cross-checking**, and **optional OCR**.
 
 ## Artifact locations
 
 | Artifact | Path |
 |---------|------|
-| Engine | [`obsidian_pro_master.py`](../obsidian_pro_master.py) (repo root) |
+| Engine | [`obsidian_pro_master.py`](../obsidian_pro_master.py) |
 | Configuration | [`config.json`](../config.json) |
 | Dependencies | [`requirements.txt`](../requirements.txt) |
 
@@ -17,49 +17,73 @@ cd /path/to/digest_documents_script
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m spacy download en_core_web_sm   # optional; entity tags skipped if missing
+python -m spacy download en_core_web_sm   # optional
+
+# Linux: OCR needs Tesseract on PATH (example Debian/Ubuntu)
+# sudo apt install tesseract-ocr tesseract-ocr-eng
 
 python obsidian_pro_master.py --config config.json --input /path/to/input_dir --output /path/to/vault_folder
 ```
 
-Optional GUI:
+Optional GUI: `python obsidian_pro_master.py --config config.json --gui`
 
-```bash
-python obsidian_pro_master.py --config config.json --gui
-```
+CLI: `--no-skip`, `--recursive`
 
-CLI flags:
+## Extraction pipeline (by type)
 
-- `--no-skip` — reprocess every file even if `process_log.json` has a success entry for that SHA-256
-- `--recursive` — include supported files in subfolders (`rglob`)
+| Input | Primary path | Fallback / cross-check |
+|--------|----------------|-------------------------|
+| `.md`, `.txt`, `.markdown` | UTF-8 read | If MarkItDown missing → still works; warning in YAML |
+| `.pdf` | Microsoft **MarkItDown** | **PyMuPDF** full-document text; if both yield substantial text, **length-ratio cross-check** (configurable); if still **low text** and `ocr_enabled` → **per-page OCR** (capped pages, DPI configurable) |
+| `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.tif`, `.bmp` | **OCR** (if `ocr_enabled` + `images_ocr`) | Else `![[filename]]` embed + note to enable OCR |
+| Office / HTML / XML / CSV / JSON | **MarkItDown** | Requires `markitdown` installed |
+
+YAML field **`content_source`** records the winning path, e.g. `markitdown`, `pymupdf`, `markitdown+pymupdf`, `ocr_pdf`, `ocr_image`, `utf8_plain`, `image_embed`.
+
+## `pkm_settings` (OCR / PDF)
+
+| Key | Meaning |
+|-----|---------|
+| `ocr_enabled` | Master switch for OCR on **images** and **low-text PDFs** |
+| `images_ocr` | When true and `ocr_enabled`, raster images become OCR’d markdown sections |
+| `ocr_langs` | Tesseract language string (e.g. `eng`, `fra+eng`) |
+| `ocr_max_pdf_pages` | Max PDF pages to rasterize for OCR (cost control) |
+| `ocr_dpi` | Render DPI for PDF→image before OCR |
+| `pdf_pymupdf_text_fallback` | Extract text with PyMuPDF when MarkItDown alone is thin |
+| `pdf_cross_check_markitdown_vs_pymupdf` | Emit **warning** if both extracts are long but **length ratio** &lt; threshold |
+| `ocr_comparison_threshold` | Ratio in \((0,1]\); below → `cross_check:` warning (not auto-failure) |
+| `prefer_longer_text_on_divergence` | When choosing between MarkItDown vs PyMuPDF text, prefer the longer |
+
+## System dependencies (OCR)
+
+Python packages alone are **not** enough: **Tesseract** must be installed and on `PATH` (so `pytesseract` can invoke it). Without it, OCR steps produce warnings and fall back to embeds or native PDF text only.
 
 ## Outputs per source file
 
-- One or more `.md` notes: `{sanitized_stem}_{NN}_{slug}.md`
-- One index note: `{sanitized_stem}_Index.md` linking all parts
-- Each note includes YAML (source, `sha256`, chapter info, tags, concepts, `processed_at`, optional `warnings`)
-- Footer **Navigation**: previous | index | next (wikilinks match actual basenames)
+- Notes: `{sanitized_stem}_{NN}_{slug}.md` + `{stem}_Index.md`
+- Front matter: `content_source`, `sha256`, tags, concepts, optional `warnings` (pipeline + cross-check + low-content notices)
+- Footer spindle: previous | index | next
 
 ## Operational files
 
-- `process_log.json` — keyed by **SHA-256** of input bytes; skip successful hashes on reruns unless `--no-skip`
-- `error_log.csv` — append-only failures
+- `process_log.json`, `error_log.csv` (paths from `system_settings`)
 
-Paths are relative to the **current working directory** unless you override in config (see `system_settings.log_file` / `error_log`).
+## Honest limitations (“no flaws” is not guaranteed)
 
-## Critical limitations (honest)
+OCR and format conversion are **heuristic**. The design minimizes silent failure:
 
-- **MarkItDown**: optional for **`.md` / `.txt` / `.markdown`** (read as UTF-8); required for PDF/DOCX/PPTX/etc. If absent, YAML `warnings` will include `markitdown_unavailable` for plain-text inputs.
-- **Image-only PDFs**: extraction may be near-empty; `warnings` will include `low_content` when below `low_content_threshold_chars`. OCR is not enabled unless you add a separate pipeline (`pkm_settings.ocr_enabled` is reserved).
-- **spaCy**: optional; missing model → no entity tags, `user_tags` still apply.
-- **Chapter regex**: invalid patterns raise a clear error; patterns with inner `(...)` capturing groups are safe (splitting uses `finditer`, not `re.split`).
+- **Garbage in / garbage out**: poor scans, skew, handwriting, or exotic fonts reduce OCR quality.
+- **Dual PDF extracts** can disagree; we **warn** (`cross_check:`) rather than pretending certainty.
+- **Chapters** still depend on your regexes; bad patterns → odd splits (but no regex split corruption from capturing groups).
+- **Large PDFs**: CPU/time grows with `ocr_max_pdf_pages` × `ocr_dpi`; tune for your machine.
+- **Security**: this tool reads user-chosen files and writes markdown; do not point it at untrusted paths without review.
 
-## Design guarantees implemented in code
+## Design guarantees (engineering)
 
-- **SHA-256** for dedupe and logging (not MD5)
-- **Atomic writes** (temp file + replace) per note
-- **Partial failure rollback**: if writing a multi-chapter document fails mid-way, already-written outputs for that source are removed
-- **Basename collision avoidance** (suffix append when two chapters would share the same filename)
-- **Worker fault isolation**: a crash in one parallel worker returns a failed result instead of killing the whole pool
+- SHA-256 for batch skip logic; atomic writes; rollback on partial multi-note failure
+- Optional multiprocessing with worker recycling; isolated worker errors
+- Invalid chapter regex → clear `ValueError` message
 
-For the broader “shared cache / vault” architecture, see `phase-1-shared-cache-mvp.md` and `roadmap.md`.
+For shared-cache / vault architecture, see `phase-1-shared-cache-mvp.md` and `roadmap.md`.
+
+**Schema alignment:** engine YAML is not the full `00_LLM_Cache` contract — see [`crosswalk-ingestion-to-cache.md`](crosswalk-ingestion-to-cache.md) and [`gap-analysis-outstanding.md`](gap-analysis-outstanding.md).

@@ -25,6 +25,11 @@ Purpose: This is the single entry point and navigation map for all project docs.
 - `templates/`: reusable templates (feature spec, ADR, change request checklist)
 - `AGENTS.md`: rules for coding agents working in this repo
 - `document-ingestion-engine.md`: **Phase deliverable** — Obsidian ingestion script (`obsidian_pro_master.py`), config, runbook
+- `gap-analysis-outstanding.md`: **critical / missing / outstanding** checklist (Phase 1 vs M1)
+- `crosswalk-ingestion-to-cache.md`: ingestion YAML vs `00_LLM_Cache` schema alignment
+- `mcp-setup-cursor.md`: scope Cursor MCP to `00_LLM_Cache` only
+- `runbooks/rebuild-redis-index.md`: wipe Redis and rebuild from vault
+- `runbooks/reconcile-cache-index.md`: fix index drift after renames/deletes
 
 ## Defaults & open questions (replace these TODOs)
 - TODO: Define the product’s primary users and top 1–3 workflows (see `product-brief.md`).

@@ -1,6 +1,21 @@
 # Contracts (Source of truth)
 
-Purpose: Define and version the interfaces this project exposes and consumes (APIs, events, schemas). The exact format is TBD until chosen.
+Purpose: Define and version the interfaces this project exposes and consumes (APIs, events, schemas).
+
+## Phase 1 shared cache (implemented in this repo)
+
+| Contract | Description |
+|----------|-------------|
+| [cache-note-schema-v1.md](cache-note-schema-v1.md) | Obsidian `00_LLM_Cache` note YAML + required sections |
+| [redis-vector-metadata-v1.md](redis-vector-metadata-v1.md) | Redis mirror fields + upsert/rebuild rules |
+
+Validate notes locally:
+
+```bash
+python scripts/validate_llm_cache.py --root /path/to/Vault --folder 00_LLM_Cache
+```
+
+## APIs & events (broader product — TBD)
 
 ## What counts as a contract
 - **API contracts**: TODO: REST/OpenAPI? GraphQL? gRPC? (pick one or more)

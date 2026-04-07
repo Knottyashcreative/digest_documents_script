@@ -1,0 +1,26 @@
+# Example only — copy to docker-compose.yml and tune. Do not commit real secrets.
+# Reference: docs/operations.md
+
+services:
+  redis-stack:
+    image: redis/redis-stack-server:latest
+    container_name: pasc_redis
+    ports:
+      - "6379:6379"
+      - "8001:8001"
+    volumes:
+      - ./data/redis:/data
+    environment:
+      - REDIS_ARGS=--save 60 1
+    # Note: deploy.resources is ignored by plain `docker compose`; use mem_limit if you need caps:
+    # mem_limit: 12g
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: pasc_n8n
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:?set in .env}
+    volumes:
+      - ./data/n8n:/home/node/.n8n

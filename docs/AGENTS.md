@@ -18,6 +18,7 @@ Purpose: Provide enforceable rules for AI coding agents so code changes stay ali
 
 ## Working routine (use this checklist)
 - Follow `docs/daily-workflow-checklist.md` for step-by-step execution and review.
+- Before changing or indexing `00_LLM_Cache` notes, run `python scripts/validate_llm_cache.py --root <vault> --folder 00_LLM_Cache` and fix failures.
 
 ## If information is missing
 - Add `TODO:` prompts in the most relevant doc rather than guessing.

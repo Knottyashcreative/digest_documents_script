@@ -2,12 +2,13 @@
 """
 Obsidian Pro Designer Engine — document → preformatted Obsidian notes.
 
-- SHA-256 content hashing, atomic writes, optional worker recycling.
-- Chapter split + spindle navigation + per-batch index note.
-- Designer lint (lists, headers, bold/italic baseline).
-- Optional spaCy entities; graceful fallback if unavailable.
-- Partial-write rollback: failed multi-note writes remove outputs from that source.
-- Basename de-duplication when chapter slugs collide.
+- Multi-format: MarkItDown (office/HTML/etc.), UTF-8 plain text, PDF dual-path
+  (MarkItDown + PyMuPDF), raster images (OCR or ![[embed]] fallback).
+- Optional OCR: Tesseract via pytesseract for images and low-text PDFs (see config).
+- Cross-check: optional length-ratio warning when MarkItDown vs PyMuPDF diverge.
+- SHA-256 hashing, atomic writes, optional worker recycling.
+- Chapter spindle + index note; designer lint; optional spaCy entities.
+- Partial-write rollback; basename de-duplication.
 """
 
 from __future__ import annotations
@@ -39,10 +40,27 @@ try:
 except ImportError:
     spacy = None  # type: ignore
 
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None  # type: ignore
+
+try:
+    import pytesseract
+    from PIL import Image
+except ImportError:
+    pytesseract = None  # type: ignore
+    Image = None  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+# Raster image extensions (OCR or Obsidian embed fallback)
+IMAGE_EXTENSIONS = frozenset(
+    {".png", ".jpg", ".jpeg", ".webp", ".gif", ".tiff", ".tif", ".bmp"}
+)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "system_settings": {
@@ -79,6 +97,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
             r"(?i)^(EPILOGUE|PROLOGUE)\b.*$",
         ],
         "ocr_enabled": False,
+        "images_ocr": True,
+        "ocr_langs": "eng",
+        "ocr_max_pdf_pages": 40,
+        "ocr_dpi": 150,
+        "pdf_pymupdf_text_fallback": True,
+        "pdf_cross_check_markitdown_vs_pymupdf": True,
+        "ocr_comparison_threshold": 0.35,
+        "prefer_longer_text_on_divergence": True,
         "callout_keywords": {},
     },
     "yaml_template": {
@@ -296,6 +322,101 @@ def split_into_chapters(full_text: str, combined_pattern: str) -> list[tuple[str
 
 
 # ---------------------------------------------------------------------------
+# PyMuPDF + OCR helpers (optional deps)
+# ---------------------------------------------------------------------------
+
+
+def pymupdf_extract_text(path: Path) -> tuple[str, int]:
+    """Return (full_text, page_count). Empty if PyMuPDF unavailable or error."""
+    if fitz is None:
+        return "", 0
+    try:
+        doc = fitz.open(path_for_open(path))
+    except Exception:
+        return "", 0
+    try:
+        parts: list[str] = []
+        for i in range(doc.page_count):
+            parts.append(doc.load_page(i).get_text("text") or "")
+        return "\n\n".join(parts).strip(), doc.page_count
+    finally:
+        doc.close()
+
+
+def ocr_pil_image(img: Any, lang: str) -> str:
+    if pytesseract is None:
+        return ""
+    try:
+        return (pytesseract.image_to_string(img, lang=lang) or "").strip()
+    except Exception:
+        return ""
+
+
+def ocr_image_path(path: Path, lang: str) -> tuple[str, list[str]]:
+    warnings: list[str] = []
+    if pytesseract is None or Image is None:
+        warnings.append(
+            "ocr_unavailable: pip install pytesseract pillow; install system tesseract-ocr (tesseract binary on PATH)"
+        )
+        return "", warnings
+    try:
+        with Image.open(path_for_open(path)) as im:
+            rgb = im.convert("RGB")
+            text = ocr_pil_image(rgb, lang)
+        if not text:
+            warnings.append("ocr_image: empty result (try other ocr_langs or image quality)")
+        return text, warnings
+    except Exception as e:
+        warnings.append(f"ocr_image_failed: {e}")
+        return "", warnings
+
+
+def ocr_pdf_pages(path: Path, max_pages: int, dpi: int, lang: str) -> tuple[str, list[str]]:
+    warnings: list[str] = []
+    if fitz is None:
+        warnings.append("ocr_pdf_unavailable: pip install pymupdf")
+        return "", warnings
+    if pytesseract is None or Image is None:
+        warnings.append(
+            "ocr_pdf_unavailable: pip install pytesseract pillow; install tesseract-ocr binary"
+        )
+        return "", warnings
+    out_chunks: list[str] = []
+    try:
+        doc = fitz.open(path_for_open(path))
+    except Exception as e:
+        warnings.append(f"ocr_pdf_open_failed: {e}")
+        return "", warnings
+    try:
+        n = min(doc.page_count, max(0, max_pages))
+        if doc.page_count > max_pages:
+            warnings.append(
+                f"ocr_pdf: processing {n}/{doc.page_count} pages (ocr_max_pdf_pages cap)"
+            )
+        mat = fitz.Matrix(dpi / 72, dpi / 72)
+        for i in range(n):
+            try:
+                page = doc.load_page(i)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                t = ocr_pil_image(img, lang)
+                if t:
+                    out_chunks.append(f"## Page {i + 1}\n\n{t}")
+            except Exception as e:
+                warnings.append(f"ocr_pdf_page_{i + 1}: {e}")
+        return "\n\n".join(out_chunks).strip(), warnings
+    finally:
+        doc.close()
+
+
+def length_balance_ratio(a: str, b: str) -> float | None:
+    la, lb = len(a), len(b)
+    if la < 20 or lb < 20:
+        return None
+    return min(la, lb) / max(la, lb)
+
+
+# ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
 
@@ -351,44 +472,131 @@ class ObsidianMasterEngine:
             )
         return raw.strip(), warnings
 
-    def convert_document(self, path: Path) -> tuple[str, list[str]]:
+    def convert_document(self, path: Path) -> tuple[str, list[str], str]:
+        """Return (markdown_body, warnings, content_source)."""
+        pkm = self.config.get("pkm_settings", {})
+        ss = self.config.get("system_settings", {})
+        ds = self.config.get("designer_settings", {})
         warnings: list[str] = []
         suffix = path.suffix.lower()
-        plain_ok = suffix in {".md", ".txt", ".markdown"}
+        low = int(ss.get("low_content_threshold_chars", 200))
+        ocr_on = bool(pkm.get("ocr_enabled", False))
+        images_ocr = bool(pkm.get("images_ocr", True))
+        ocr_lang = str(pkm.get("ocr_langs", "eng"))
+        ocr_max_pages = int(pkm.get("ocr_max_pdf_pages", 40))
+        ocr_dpi = int(pkm.get("ocr_dpi", 150))
+        cross_threshold = float(pkm.get("ocr_comparison_threshold", 0.35))
+        prefer_longer = bool(pkm.get("prefer_longer_text_on_divergence", True))
+        pdf_pm = bool(pkm.get("pdf_pymupdf_text_fallback", True))
+        cross = bool(pkm.get("pdf_cross_check_markitdown_vs_pymupdf", True))
 
-        if plain_ok:
+        text = ""
+        content_source = "unknown"
+
+        if suffix in {".md", ".txt", ".markdown"}:
             text, w = self._plain_text_fallback(path)
             warnings.extend(w)
-        elif self._mid is None:
-            raise RuntimeError(
-                "markitdown not installed; pip install markitdown "
-                f"(required for {suffix})"
-            )
+            content_source = "utf8_plain"
+
+        elif suffix in IMAGE_EXTENSIONS:
+            content_source = "image_embed"
+            if images_ocr and ocr_on:
+                ocr_body, ow = ocr_image_path(path, ocr_lang)
+                warnings.extend(ow)
+                if ocr_body:
+                    text = f"## Image OCR ({path.name})\n\n{ocr_body}"
+                    content_source = "ocr_image"
+                else:
+                    text = (
+                        f"![[{path.name}]]\n\n"
+                        f"_OCR returned no text. Check tesseract install and `pkm_settings.ocr_langs`._\n"
+                    )
+                    warnings.append("image_ocr_empty")
+            elif images_ocr and not ocr_on:
+                text = f"![[{path.name}]]\n\n_Enable `pkm_settings.ocr_enabled` to OCR raster images._\n"
+                warnings.append("image_ocr_skipped_disabled")
+            else:
+                text = f"![[{path.name}]]\n"
+
+        elif suffix == ".pdf":
+            md_text = ""
+            if self._mid is not None:
+                try:
+                    result = self._mid.convert(str(path))
+                    md_text = (result.text_content or "").strip()
+                except Exception as e:
+                    warnings.append(f"markitdown_pdf: {e}")
+            pm_text = ""
+            page_count = 0
+            if pdf_pm:
+                pm_text, page_count = pymupdf_extract_text(path)
+                if not pm_text and fitz is None:
+                    warnings.append("pymupdf_not_installed: pip install pymupdf for PDF text fallback")
+
+            if cross and md_text and pm_text:
+                lr = length_balance_ratio(md_text, pm_text)
+                if lr is not None and lr < cross_threshold:
+                    warnings.append(
+                        f"cross_check: markitdown_vs_pymupdf length_ratio={lr:.3f} "
+                        f"(threshold={cross_threshold}); sources diverge — review output"
+                    )
+
+            if prefer_longer:
+                if len(md_text) >= len(pm_text):
+                    text = md_text or pm_text
+                    content_source = "markitdown" if md_text else "pymupdf"
+                else:
+                    text = pm_text
+                    content_source = "pymupdf"
+            else:
+                text = md_text if md_text else pm_text
+                content_source = "markitdown" if md_text else "pymupdf"
+
+            if md_text and pm_text:
+                content_source = "markitdown+pymupdf"
+
+            # Image-heavy PDF: OCR fallback when text still short
+            if len(text) < low and ocr_on:
+                cap = ocr_max_pages if page_count == 0 else min(ocr_max_pages, page_count)
+                ocr_body, ow = ocr_pdf_pages(path, cap, ocr_dpi, ocr_lang)
+                warnings.extend(ow)
+                if len(ocr_body) > len(text):
+                    text = ocr_body
+                    content_source = "ocr_pdf"
+                    warnings.append("ocr_pdf_replaced_low_native_text")
+
+            if not text.strip():
+                raise RuntimeError(
+                    "PDF produced no text (markitdown + pymupdf). "
+                    "Enable pkm_settings.ocr_enabled and install pymupdf + pytesseract + tesseract binary, "
+                    "or check the PDF."
+                )
+
         else:
+            if self._mid is None:
+                raise RuntimeError(
+                    "markitdown not installed; pip install markitdown "
+                    f"(required for {suffix})"
+                )
             try:
                 result = self._mid.convert(str(path))
                 text = (result.text_content or "").strip()
             except Exception as e:
                 raise RuntimeError(f"convert failed: {e}") from e
+            content_source = "markitdown"
 
-        low = int(
-            self.config.get("system_settings", {}).get(
-                "low_content_threshold_chars", 200
-            )
-        )
         if len(text) < low:
             warnings.append(
                 f"low_content: extracted text length {len(text)} < threshold {low} "
-                "(image-only PDF / empty export?)"
+                "(short doc, image-heavy file, or OCR quality limit)"
             )
 
-        ds = self.config.get("designer_settings", {})
         text = apply_designer_linting(
             text,
             bool(ds.get("strict_markdown", True)),
             str(ds.get("list_marker", "-")),
         )
-        return text, warnings
+        return text, warnings, content_source
 
     def build_meta(
         self,
@@ -399,6 +607,7 @@ class ObsidianMasterEngine:
         tags: set[str],
         concepts: list[str],
         extra_warnings: list[str],
+        content_source: str = "unknown",
     ) -> dict[str, Any]:
         template = dict(self.config.get("yaml_template") or {})
         template_tags = {t for t in (template.get("tags") or []) if isinstance(t, str)}
@@ -411,6 +620,7 @@ class ObsidianMasterEngine:
             "chapter_title": chapter_title[:500],
             "tags": merged_tags,
             "concepts": concepts,
+            "content_source": content_source[:120],
             "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         if extra_warnings:
@@ -455,7 +665,7 @@ class ObsidianMasterEngine:
         stem_safe = slugify_title(input_path.stem, max_len=60, preserve_unicode=preserve)
 
         try:
-            content, conv_warnings = self.convert_document(input_path)
+            content, conv_warnings, content_source = self.convert_document(input_path)
             warnings.extend(conv_warnings)
             for w in conv_warnings:
                 logging.info("%s: %s", input_path.name, w)
@@ -499,6 +709,7 @@ class ObsidianMasterEngine:
                     tags,
                     concepts,
                     list(warnings) if idx == 0 else [],
+                    content_source=content_source,
                 )
                 yaml_block = (
                     "---\n"
@@ -532,6 +743,7 @@ class ObsidianMasterEngine:
                 tags,
                 concepts,
                 warnings,
+                content_source=content_source,
             )
             index_meta["role"] = "index"
             yaml_block = (
@@ -673,7 +885,7 @@ def iter_input_files(folder: Path, recursive: bool = False) -> list[Path]:
         ".csv",
         ".json",
         ".xml",
-    }
+    } | set(IMAGE_EXTENSIONS)
     out: list[Path] = []
     if recursive:
         for p in sorted(folder.rglob("*")):

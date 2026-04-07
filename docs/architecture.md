@@ -2,6 +2,19 @@
 
 Purpose: Describe system boundaries, ownership, and how parts interact. Keep external dependencies as black boxes until named.
 
+## Phase 1 shared cache (concrete in this repo)
+
+```text
+Obsidian 00_LLM_Cache/  (--yaml + sections: SSoT)
+        │ validate (scripts/validate_llm_cache.py)
+        ▼
+Indexer (e.g. n8n)  →  embed (model per ADR 0002)  →  Redis Stack (vector + metadata per contracts/redis-vector-metadata-v1.md)
+        ▲
+Cursor MCP (vault scoped to 00_LLM_Cache only — docs/mcp-setup-cursor.md)
+```
+
+Details: [operations.md](operations.md), [phase-1-shared-cache-mvp.md](phase-1-shared-cache-mvp.md).
+
 ## Context (what this system is)
 - TODO: 2–5 sentences describing what the system does.
 - TODO: What the system is *not* responsible for.

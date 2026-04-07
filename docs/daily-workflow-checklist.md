@@ -9,6 +9,7 @@ Purpose: Provide a step-by-step daily routine that connects product intent, cont
 - [ ] **Identify contract touchpoints**: if you’ll change an interface, open `contracts/README.md` and decide where the source-of-truth artifact will live (still TBD is ok, but document the plan).
 - [ ] **Confirm your “definition of done”**: re-check `engineering-standards.md` and the checklist you’ll need to satisfy.
 - [ ] **Phase 1 cache health** (if working on memory): skim `phase-1-shared-cache-mvp.md` acceptance tests and confirm yesterday’s invariants still hold.
+- [ ] **Validate cache notes** (if editing `00_LLM_Cache`): `python scripts/validate_llm_cache.py --root <vault> --folder 00_LLM_Cache`
 
 ## Before writing code (5 minutes)
 - [ ] **Choose the right spec artifact**:

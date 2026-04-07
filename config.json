@@ -38,7 +38,14 @@
       "(?i)^(EPILOGUE|PROLOGUE)\\b.*$"
     ],
     "ocr_enabled": false,
-    "ocr_comparison_threshold": 0.85,
+    "images_ocr": true,
+    "ocr_langs": "eng",
+    "ocr_max_pdf_pages": 40,
+    "ocr_dpi": 150,
+    "pdf_pymupdf_text_fallback": true,
+    "pdf_cross_check_markitdown_vs_pymupdf": true,
+    "ocr_comparison_threshold": 0.35,
+    "prefer_longer_text_on_divergence": true,
     "callout_keywords": {
       "Note": "[!INFO]",
       "Important": "[!IMPORTANT]",

@@ -7,6 +7,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Secrets (use .env.example as template)
+.env
+
 # Local / generated ingestion artifacts
 process_log.json
 error_log.csv

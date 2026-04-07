@@ -1,3 +1,11 @@
+# Core conversion + config
 markitdown>=0.0.1
-spacy>=3.7.0
 PyYAML>=6.0
+spacy>=3.7.0
+
+# PDF text fallback + rasterization for OCR
+pymupdf>=1.23.0
+
+# Image OCR (requires tesseract-ocr installed on the OS — see docs)
+Pillow>=10.0.0
+pytesseract>=0.3.10

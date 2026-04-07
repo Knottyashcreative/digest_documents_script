@@ -2,6 +2,8 @@
 
 Purpose: Define the smallest complete “shared cache” that reliably stores and retrieves validated programming/coding solutions across projects, and learns from queries by turning answers into reusable assets.
 
+**Implementation status:** This file is the **spec**. What is shipped vs still open in the repo is tracked in [`gap-analysis-outstanding.md`](gap-analysis-outstanding.md). Ingestion output vs this note schema: [`crosswalk-ingestion-to-cache.md`](crosswalk-ingestion-to-cache.md).
+
 ## MVP scope (do now)
 - **SSoT**: The Obsidian folder `00_LLM_Cache` is the *master record*.
 - **Volatile accelerator**: Redis is a cache that can be rebuilt from Obsidian at any time.
@@ -32,7 +34,7 @@ Purpose: Define the smallest complete “shared cache” that reliably stores an
 - `fingerprint`: TODO: hash of canonicalized solution (used for dedupe)
 - `adversarial_status`: `tentative` | `verified` | `deprecated`
 - `similarity_gate`: TODO: default threshold for retrieval acceptance
-- `embedding_model`: TODO: model identifier (must be consistent within an index)
+- `embedding_model`: must match [ADR 0002](adr/0002-embedding-model-phase1-lock.md) and your indexer config
 - `schema_version`: `1` (increment only when the note schema changes)
 - `source`:
   - `project`: TODO
@@ -60,7 +62,7 @@ Purpose: Define the smallest complete “shared cache” that reliably stores an
 - **MVP amendment**:
   - Store `embedding_model` in every note and in Redis metadata.
   - Enforce “one model per index namespace”; changing the model requires a full rebuild job.
-  - TODO: Choose the initial embedding model and lock it for Phase 1.
+  - **Locked for Phase 1:** see [ADR 0002](adr/0002-embedding-model-phase1-lock.md) (`nomic-embed-text-v1.5` or superseding ADR if you swap runtime).
 
 ### 2) Sync collision / partial writes
 - **Risk**: Redis contains entries that don’t exist (or don’t match) on disk; retrieval returns ghosts.
@@ -120,10 +122,14 @@ Purpose: Define the smallest complete “shared cache” that reliably stores an
   - Require “why chosen” metadata in the retrieval response (at least: similarity score + status + fingerprint).
 
 ## MVP acceptance tests (must pass)
-- [ ] Cursor can read a known test note from `00_LLM_Cache` via MCP.
-- [ ] Saving a new note triggers a Redis upsert (or a documented manual reindex step).
-- [ ] Redis entries include `uuid`, `fingerprint`, `embedding_model`, `source_path`, `mtime`, and a vector.
-- [ ] Deleting Redis data and re-running indexing fully rebuilds the cache from Obsidian notes.
-- [ ] Renaming/moving a note in `00_LLM_Cache` does not create duplicates and does not break retrieval.
-- [ ] A malformed note (missing required fields) is rejected with a visible error (not silently skipped).
+
+**Repo support today:** schema contract + validator CLI + runbooks + MCP doc + example compose + ADR embedding lock.  
+**You still execute** MCP/Redis/n8n in your environment and tick these when true.
+
+- [ ] Cursor can read a known test note from `00_LLM_Cache` via MCP — [setup](mcp-setup-cursor.md).
+- [ ] Saving a new note triggers a Redis upsert (or documented manual reindex) — [n8n expectations](../n8n/README.md).
+- [ ] Redis entries include `uuid`, `fingerprint`, `embedding_model`, `source_path`, `mtime`, and a vector — [contract](contracts/redis-vector-metadata-v1.md).
+- [ ] Deleting Redis data and re-running indexing fully rebuilds the cache — [runbook](runbooks/rebuild-redis-index.md).
+- [ ] Renaming/moving/deleting is handled — [reconcile runbook](runbooks/reconcile-cache-index.md).
+- [ ] A malformed note is rejected visibly — `python scripts/validate_llm_cache.py` + indexer must skip/alert on failure — [note contract](contracts/cache-note-schema-v1.md).
 
