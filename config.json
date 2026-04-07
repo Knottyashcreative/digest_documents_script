@@ -1,0 +1,53 @@
+{
+  "system_settings": {
+    "processing_mode": "parallel",
+    "core_tiers": {
+      "ultra_safe": 2,
+      "safe": 8,
+      "performance_plus": 12,
+      "aggressive": 16
+    },
+    "selected_tier": "safe",
+    "hash_algorithm": "sha256",
+    "max_tasks_per_worker": 5,
+    "atomic_writes": true,
+    "log_file": "process_log.json",
+    "error_log": "error_log.csv",
+    "low_content_threshold_chars": 200
+  },
+  "nlp_settings": {
+    "engine": "spacy",
+    "model": "en_core_web_sm",
+    "extract_entities": ["PERSON", "ORG", "GPE"],
+    "user_tags": ["Designer-Approved", "Project-Alpha"],
+    "extract_concepts_count": 5
+  },
+  "designer_settings": {
+    "strict_markdown": true,
+    "bold_syntax": "asterisks",
+    "list_marker": "-",
+    "preserve_unicode_filenames": true,
+    "chapter_pattern": "(?i)^#+\\s*(Chapter|Section|Part)\\s*\\d+"
+  },
+  "pkm_settings": {
+    "split_chapters": true,
+    "chapter_patterns": [
+      "(?i)^#+\\s*(Chapter|Section|Part)\\s*\\d+\\s*:?.*$",
+      "(?i)^Chapter\\s+\\d+\\s*:?.*$",
+      "(?i)^Section\\s+\\d+\\s*:?.*$",
+      "(?i)^(EPILOGUE|PROLOGUE)\\b.*$"
+    ],
+    "ocr_enabled": false,
+    "ocr_comparison_threshold": 0.85,
+    "callout_keywords": {
+      "Note": "[!INFO]",
+      "Important": "[!IMPORTANT]",
+      "Warning": "[!CAUTION]"
+    }
+  },
+  "yaml_template": {
+    "tags": ["processed", "automated"],
+    "aliases": [],
+    "status": "raw"
+  }
+}

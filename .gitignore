@@ -1,0 +1,20 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local / generated ingestion artifacts
+process_log.json
+error_log.csv
+*.tmp
+fixtures/out/
+
+# Tooling (keep repo source-only)
+.specstory/
+
+.DS_Store
+Thumbs.db

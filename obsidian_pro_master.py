@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+"""
+Obsidian Pro Designer Engine — document → preformatted Obsidian notes.
+
+- SHA-256 content hashing, atomic writes, optional worker recycling.
+- Chapter split + spindle navigation + per-batch index note.
+- Designer lint (lists, headers, bold/italic baseline).
+- Optional spaCy entities; graceful fallback if unavailable.
+- Partial-write rollback: failed multi-note writes remove outputs from that source.
+- Basename de-duplication when chapter slugs collide.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import os
+import re
+import tempfile
+import time
+import unicodedata
+from dataclasses import dataclass, field
+from multiprocessing import Pool, cpu_count
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+# Optional heavy deps (import lazily in workers if needed)
+try:
+    from markitdown import MarkItDown
+except ImportError:
+    MarkItDown = None  # type: ignore
+
+try:
+    import spacy
+except ImportError:
+    spacy = None  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "system_settings": {
+        "processing_mode": "sequential",
+        "core_tiers": {"ultra_safe": 2, "safe": 4, "performance_plus": 8, "aggressive": 12},
+        "selected_tier": "safe",
+        "hash_algorithm": "sha256",
+        "max_tasks_per_worker": 5,
+        "atomic_writes": True,
+        "log_file": "process_log.json",
+        "error_log": "error_log.csv",
+        "low_content_threshold_chars": 200,
+    },
+    "nlp_settings": {
+        "engine": "spacy",
+        "model": "en_core_web_sm",
+        "extract_entities": ["PERSON", "ORG", "GPE"],
+        "user_tags": [],
+        "extract_concepts_count": 5,
+    },
+    "designer_settings": {
+        "strict_markdown": True,
+        "bold_syntax": "asterisks",
+        "list_marker": "-",
+        "preserve_unicode_filenames": True,
+        "chapter_pattern": r"(?i)^#+\s*(Chapter|Section|Part)\s*\d+",
+    },
+    "pkm_settings": {
+        "split_chapters": True,
+        "chapter_patterns": [
+            r"(?i)^#+\s*(Chapter|Section|Part)\s*\d+\s*:?.*$",
+            r"(?i)^Chapter\s+\d+\s*:?.*$",
+            r"(?i)^Section\s+\d+\s*:?.*$",
+            r"(?i)^(EPILOGUE|PROLOGUE)\b.*$",
+        ],
+        "ocr_enabled": False,
+        "callout_keywords": {},
+    },
+    "yaml_template": {
+        "tags": ["processed"],
+        "aliases": [],
+        "status": "raw",
+    },
+}
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Config not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    merged = json.loads(json.dumps(DEFAULT_CONFIG))
+    _deep_update(merged, cfg)
+    _validate_config(merged)
+    return merged
+
+
+def _deep_update(base: dict, over: dict) -> None:
+    for k, v in over.items():
+        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+            _deep_update(base[k], v)
+        else:
+            base[k] = v
+
+
+def _validate_config(cfg: dict[str, Any]) -> None:
+    ss = cfg.get("system_settings", {})
+    if ss.get("hash_algorithm", "sha256").lower() not in ("sha256", "sha-256"):
+        raise ValueError("system_settings.hash_algorithm must be sha256 for this engine.")
+    tier = ss.get("selected_tier", "safe")
+    tiers = ss.get("core_tiers", {})
+    if tier not in tiers:
+        raise ValueError(f"selected_tier '{tier}' missing from core_tiers.")
+    mtw = int(ss.get("max_tasks_per_worker", 5))
+    if mtw < 1:
+        raise ValueError("max_tasks_per_worker must be >= 1")
+
+
+# ---------------------------------------------------------------------------
+# Paths / hashing / atomic IO
+# ---------------------------------------------------------------------------
+
+def path_for_open(path: Path) -> str:
+    """Use Win32 extended path when very long paths are likely."""
+    s = str(path.resolve())
+    if os.name == "nt" and len(s) > 220 and not s.startswith("\\\\?\\"):
+        return "\\\\?\\" + s
+    return s
+
+
+def file_sha256(filepath: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path_for_open(filepath), "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        suffix=".tmp", prefix=path.name + ".", dir=str(path.parent)
+    )
+    tmp_path = Path(tmp)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="\n") as wf:
+            wf.write(text)
+        os.replace(str(tmp_path), path_for_open(path))
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Text / designer lint
+# ---------------------------------------------------------------------------
+
+
+def slugify_title(text: str, max_len: int = 80, preserve_unicode: bool = True) -> str:
+    t = text.strip()
+    if not preserve_unicode:
+        t = unicodedata.normalize("NFKD", t)
+        t = t.encode("ascii", "ignore").decode("ascii")
+    # Strip `#` so headings do not pollute filenames / wikilinks on disk.
+    t = re.sub(r'[#<>:"/\\|?*\n\r\t]', "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        t = "section"
+    return t[:max_len]
+
+
+def apply_designer_linting(text: str, strict: bool, list_marker: str) -> str:
+    if not strict:
+        return text.rstrip() + "\n"
+
+    out = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Bullet normalization: leading * or + -> -
+    out = re.sub(r"^(\s*)[*+]\s+", rf"\1{list_marker} ", out, flags=re.MULTILINE)
+
+    # __bold__ -> **bold**
+    out = re.sub(r"__([^_]+)__", r"**\1**", out)
+
+    # Trim excessive blank lines around headings: at least one blank before # at line start (not first line)
+    lines = out.split("\n")
+    normalized: list[str] = []
+    for i, line in enumerate(lines):
+        if re.match(r"^#+\s", line) and normalized and normalized[-1].strip() != "":
+            normalized.append("")
+        normalized.append(line)
+        if re.match(r"^#+\s", line):
+            if i + 1 < len(lines) and lines[i + 1].strip() != "" and not re.match(
+                r"^#+\s", lines[i + 1]
+            ):
+                pass  # ensure blank after header in second pass
+    out = "\n".join(normalized)
+
+    # One blank line after ATX headers
+    parts = re.split(r"(^#+\s.*$)", out, flags=re.MULTILINE)
+    rebuilt: list[str] = []
+    for j, p in enumerate(parts):
+        rebuilt.append(p)
+        if re.match(r"^#+\s", p, flags=re.MULTILINE) and j + 1 < len(parts):
+            nxt = parts[j + 1]
+            if nxt and not nxt.startswith("\n"):
+                rebuilt.append("\n")
+    out = "".join(rebuilt)
+
+    # Italic: prefer _word_ for simple *italic* not part of **
+    def _italic_sub(m: re.Match[str]) -> str:
+        inner = m.group(1)
+        if "**" in inner:
+            return m.group(0)
+        return "_" + inner + "_"
+
+    out = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", _italic_sub, out)
+
+    return out.rstrip() + "\n"
+
+
+def simple_concepts(text: str, n: int) -> list[str]:
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_-]{5,}", text.lower())
+    seen: set[str] = set()
+    out: list[str] = []
+    for w in words:
+        if w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+        if len(out) >= n:
+            break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Chapter splitting (spindle prep)
+# ---------------------------------------------------------------------------
+
+
+def _strip_inline_flags(pattern: str) -> str:
+    """Remove leading (?i) etc. so alternation compiles; use re.IGNORECASE instead."""
+    p = pattern.strip()
+    while True:
+        if p.startswith("(?i)"):
+            p = p[4:].lstrip()
+            continue
+        if p.startswith("(?-i)"):
+            p = p[5:].lstrip()
+            continue
+        break
+    return p
+
+
+def combined_chapter_regex(patterns: list[str], fallback: str) -> str:
+    patts = [_strip_inline_flags(p) for p in patterns if p and p.strip()]
+    if not patts:
+        patts = [_strip_inline_flags(fallback)]
+    return "|".join(f"(?:{p})" for p in patts)
+
+
+def split_into_chapters(full_text: str, combined_pattern: str) -> list[tuple[str, str]]:
+    """Slice by chapter headers. Uses finditer so inner `(...)` in patterns cannot break splitting."""
+    flags = re.MULTILINE | re.IGNORECASE
+    try:
+        rx = re.compile(combined_pattern, flags)
+    except re.error as e:
+        raise ValueError(f"Invalid chapter regex ({combined_pattern!r}): {e}") from e
+
+    matches = list(rx.finditer(full_text))
+    if not matches:
+        return [("Full Document", full_text.strip())]
+
+    chapters: list[tuple[str, str]] = []
+    first_start = matches[0].start()
+    intro = full_text[:first_start].strip()
+    if intro:
+        chapters.append(("Introduction", intro))
+
+    for i, m in enumerate(matches):
+        title = m.group(0).strip()
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
+        body = full_text[body_start:body_end].strip()
+        chapters.append((title, body))
+    return chapters
+
+
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProcessResult:
+    ok: bool
+    source: str
+    message: str = ""
+    duration_s: float = 0.0
+    outputs: list[str] = field(default_factory=list)
+    sha256: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+
+class ObsidianMasterEngine:
+    def __init__(self, config: dict[str, Any]):
+        self.config = config
+        self._mid = None
+        self._nlp = None
+        if MarkItDown is not None:
+            self._mid = MarkItDown()
+        self._load_nlp()
+
+    def _load_nlp(self) -> None:
+        self._nlp = None
+        if spacy is None:
+            return
+        model = self.config.get("nlp_settings", {}).get("model", "en_core_web_sm")
+        try:
+            self._nlp = spacy.load(model)
+        except Exception:
+            self._nlp = None
+
+    def extract_tags(self, content_sample: str) -> set[str]:
+        tags: set[str] = set(self.config.get("nlp_settings", {}).get("user_tags") or [])
+        if self._nlp and content_sample:
+            try:
+                doc = self._nlp(content_sample[:50_000])
+                want = set(self.config.get("nlp_settings", {}).get("extract_entities") or [])
+                for ent in doc.ents:
+                    if ent.label_ in want and ent.text.strip():
+                        tags.add(ent.text.strip()[:100])
+            except Exception:
+                pass
+        return tags
+
+    def _plain_text_fallback(self, path: Path) -> tuple[str, list[str]]:
+        warnings: list[str] = []
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        if self._mid is None:
+            warnings.append(
+                "markitdown_unavailable: extracted as plain UTF-8 (install markitdown for PDF/DOCX)"
+            )
+        return raw.strip(), warnings
+
+    def convert_document(self, path: Path) -> tuple[str, list[str]]:
+        warnings: list[str] = []
+        suffix = path.suffix.lower()
+        plain_ok = suffix in {".md", ".txt", ".markdown"}
+
+        if plain_ok:
+            text, w = self._plain_text_fallback(path)
+            warnings.extend(w)
+        elif self._mid is None:
+            raise RuntimeError(
+                "markitdown not installed; pip install markitdown "
+                f"(required for {suffix})"
+            )
+        else:
+            try:
+                result = self._mid.convert(str(path))
+                text = (result.text_content or "").strip()
+            except Exception as e:
+                raise RuntimeError(f"convert failed: {e}") from e
+
+        low = int(
+            self.config.get("system_settings", {}).get(
+                "low_content_threshold_chars", 200
+            )
+        )
+        if len(text) < low:
+            warnings.append(
+                f"low_content: extracted text length {len(text)} < threshold {low} "
+                "(image-only PDF / empty export?)"
+            )
+
+        ds = self.config.get("designer_settings", {})
+        text = apply_designer_linting(
+            text,
+            bool(ds.get("strict_markdown", True)),
+            str(ds.get("list_marker", "-")),
+        )
+        return text, warnings
+
+    def build_meta(
+        self,
+        source_name: str,
+        file_hash: str,
+        chapter_idx: int | None,
+        chapter_title: str,
+        tags: set[str],
+        concepts: list[str],
+        extra_warnings: list[str],
+    ) -> dict[str, Any]:
+        template = dict(self.config.get("yaml_template") or {})
+        template_tags = {t for t in (template.get("tags") or []) if isinstance(t, str)}
+        merged_tags = sorted(template_tags | tags)
+        meta: dict[str, Any] = {
+            **template,
+            "source": source_name,
+            "sha256": file_hash,
+            "chapter": chapter_idx,
+            "chapter_title": chapter_title[:500],
+            "tags": merged_tags,
+            "concepts": concepts,
+            "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if extra_warnings:
+            meta["warnings"] = extra_warnings
+        _validate_meta_flat(meta)
+        return meta
+
+    def _note_basenames(
+        self,
+        stem_safe: str,
+        chapters: list[tuple[str, str]],
+        preserve_unicode: bool,
+    ) -> list[str]:
+        basenames: list[str] = []
+        counts: dict[str, int] = {}
+        for idx, (title, _body) in enumerate(chapters):
+            slug = slugify_title(title, preserve_unicode=preserve_unicode)
+            key = f"{stem_safe}_{idx:02d}_{slug}"
+            if len(key) > 180:
+                key = key[:180].rstrip("_")
+            if key in counts:
+                counts[key] += 1
+                base = f"{key}_{counts[key]}"
+            else:
+                counts[key] = 0
+                base = key
+            basenames.append(base)
+        return basenames
+
+    def process_file(self, input_path: Path, output_dir: Path) -> ProcessResult:
+        t0 = time.time()
+        outputs: list[str] = []
+        warnings: list[str] = []
+        written_paths: list[Path] = []
+
+        if not input_path.is_file():
+            return ProcessResult(False, input_path.name, "not a file", time.time() - t0)
+
+        h = file_sha256(input_path)
+        ds = self.config.get("designer_settings", {})
+        preserve = bool(ds.get("preserve_unicode_filenames", True))
+        stem_safe = slugify_title(input_path.stem, max_len=60, preserve_unicode=preserve)
+
+        try:
+            content, conv_warnings = self.convert_document(input_path)
+            warnings.extend(conv_warnings)
+            for w in conv_warnings:
+                logging.info("%s: %s", input_path.name, w)
+        except Exception as e:
+            return ProcessResult(False, input_path.name, str(e), time.time() - t0, sha256=h)
+
+        pkm = self.config.get("pkm_settings", {})
+        split = bool(pkm.get("split_chapters", True))
+        designer_pat = str(ds.get("chapter_pattern", ""))
+        patterns = list(pkm.get("chapter_patterns") or [])
+        combined = combined_chapter_regex(patterns, designer_pat)
+
+        if split:
+            chapters = split_into_chapters(content, combined)
+        else:
+            chapters = [("Full Document", content)]
+
+        basenames = self._note_basenames(stem_safe, chapters, preserve_unicode=preserve)
+        index_basename = f"{stem_safe}_Index"
+
+        n_concepts = int(
+            self.config.get("nlp_settings", {}).get("extract_concepts_count", 5)
+        )
+        concepts = simple_concepts(content, n_concepts)
+        tags = self.extract_tags(content)
+
+        atomic = bool(self.config.get("system_settings", {}).get("atomic_writes", True))
+
+        try:
+            for idx, ((title, body), base) in enumerate(zip(chapters, basenames)):
+                prev_l = f"[[{basenames[idx - 1]}]]" if idx > 0 else "START"
+                next_l = f"[[{basenames[idx + 1]}]]" if idx + 1 < len(basenames) else "END"
+                nav = (
+                    f"\n\n---\n**Navigation**: {prev_l} | [[{index_basename}]] | {next_l}\n"
+                )
+                meta = self.build_meta(
+                    input_path.name,
+                    h,
+                    idx + 1 if len(chapters) > 1 else None,
+                    title,
+                    tags,
+                    concepts,
+                    list(warnings) if idx == 0 else [],
+                )
+                yaml_block = (
+                    "---\n"
+                    + yaml.safe_dump(
+                        meta,
+                        allow_unicode=True,
+                        sort_keys=False,
+                        default_flow_style=False,
+                    )
+                    + "---\n\n"
+                )
+                note_body = body + nav
+                out_path = output_dir / f"{base}.md"
+                full = yaml_block + note_body
+                if atomic:
+                    atomic_write_text(out_path, full)
+                else:
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_text(full, encoding="utf-8")
+                written_paths.append(out_path)
+                outputs.append(str(out_path))
+
+            index_lines = [f"# Index: {input_path.name}", ""]
+            for b in basenames:
+                index_lines.append(f"- [[{b}]]")
+            index_meta = self.build_meta(
+                input_path.name,
+                h,
+                None,
+                "Index",
+                tags,
+                concepts,
+                warnings,
+            )
+            index_meta["role"] = "index"
+            yaml_block = (
+                "---\n"
+                + yaml.safe_dump(
+                    index_meta,
+                    allow_unicode=True,
+                    sort_keys=False,
+                    default_flow_style=False,
+                )
+                + "---\n\n"
+            )
+            index_path = output_dir / f"{index_basename}.md"
+            index_body = "\n".join(index_lines) + "\n"
+            if atomic:
+                atomic_write_text(index_path, yaml_block + index_body)
+            else:
+                index_path.write_text(yaml_block + index_body, encoding="utf-8")
+            written_paths.append(index_path)
+            outputs.append(str(index_path))
+        except Exception as e:
+            for p in reversed(written_paths):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            return ProcessResult(
+                False, input_path.name, str(e), time.time() - t0, sha256=h
+            )
+
+        return ProcessResult(
+            True,
+            input_path.name,
+            "",
+            time.time() - t0,
+            outputs,
+            sha256=h,
+            warnings=warnings,
+        )
+
+
+def _validate_meta_flat(meta: dict[str, Any]) -> None:
+    """Reject nested structures that often break Obsidian property panels."""
+    for k, v in meta.items():
+        if isinstance(v, dict):
+            raise ValueError(f"yaml field {k!r} must not be nested dict; flatten or stringify.")
+
+
+# ---------------------------------------------------------------------------
+# Multiprocessing (worker recycling)
+# ---------------------------------------------------------------------------
+
+_WORKER_ENGINE: ObsidianMasterEngine | None = None
+
+
+def _pool_init(config_path: str) -> None:
+    global _WORKER_ENGINE
+    cfg = load_config(Path(config_path))
+    _WORKER_ENGINE = ObsidianMasterEngine(cfg)
+
+
+def _pool_process(task: tuple[str, str]) -> dict[str, Any]:
+    inp, outd = task
+    try:
+        assert _WORKER_ENGINE is not None
+        r = _WORKER_ENGINE.process_file(Path(inp), Path(outd))
+        return {
+            "ok": r.ok,
+            "source": r.source,
+            "message": r.message,
+            "duration_s": r.duration_s,
+            "outputs": r.outputs,
+            "sha256": r.sha256,
+            "warnings": r.warnings,
+        }
+    except Exception as e:
+        logging.exception("Worker failed for %s", inp)
+        h = ""
+        try:
+            h = file_sha256(Path(inp))
+        except OSError:
+            pass
+        return {
+            "ok": False,
+            "source": Path(inp).name,
+            "message": f"{type(e).__name__}: {e}",
+            "duration_s": 0.0,
+            "outputs": [],
+            "sha256": h,
+            "warnings": [],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+
+def load_process_log(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    with path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_process_log(path: Path, data: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+ERROR_CSV_FIELDS = ("ts", "file", "error", "sha256")
+
+
+def append_error_csv(path: Path, row: dict[str, str]) -> None:
+    exists = path.is_file()
+    normalized = {k: str(row.get(k, "")) for k in ERROR_CSV_FIELDS}
+    with path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(ERROR_CSV_FIELDS))
+        if not exists:
+            w.writeheader()
+        w.writerow(normalized)
+
+
+# ---------------------------------------------------------------------------
+# Batch run
+# ---------------------------------------------------------------------------
+
+def iter_input_files(folder: Path, recursive: bool = False) -> list[Path]:
+    exts = {
+        ".pdf",
+        ".docx",
+        ".doc",
+        ".pptx",
+        ".xlsx",
+        ".xls",
+        ".html",
+        ".htm",
+        ".txt",
+        ".md",
+        ".csv",
+        ".json",
+        ".xml",
+    }
+    out: list[Path] = []
+    if recursive:
+        for p in sorted(folder.rglob("*")):
+            if p.is_file() and p.suffix.lower() in exts:
+                out.append(p)
+    else:
+        for p in sorted(folder.iterdir()):
+            if p.is_file() and p.suffix.lower() in exts:
+                out.append(p)
+    return out
+
+
+def run_batch(
+    config_path: Path,
+    input_dir: Path,
+    output_dir: Path,
+    *,
+    no_skip: bool = False,
+    recursive: bool = False,
+) -> int:
+    cfg = load_config(config_path)
+    ss = cfg["system_settings"]
+    log_file = Path(ss.get("log_file", "process_log.json"))
+    err_file = Path(ss.get("error_log", "error_log.csv"))
+    cache = load_process_log(log_file)
+
+    files = iter_input_files(input_dir, recursive=recursive)
+    if not files:
+        logging.warning("No supported files in %s", input_dir)
+        return 1
+
+    tier_name = ss.get("selected_tier", "safe")
+    nproc = int(ss.get("core_tiers", {}).get(tier_name, 4))
+    nproc = max(1, min(nproc, cpu_count() or 4))
+    mode = ss.get("processing_mode", "parallel")
+    max_tasks = int(ss.get("max_tasks_per_worker", 5))
+
+    tasks: list[tuple[str, str]] = []
+    for f in files:
+        h = file_sha256(f)
+        if not no_skip:
+            prev = cache.get(h)
+            if isinstance(prev, dict) and prev.get("status") == "success":
+                logging.info("skip unchanged (sha256 hit): %s", f.name)
+                continue
+        tasks.append((str(f.resolve()), str(output_dir.resolve())))
+
+    results: list[dict[str, Any]] = []
+    if not tasks:
+        logging.info("Nothing to do (all skipped).")
+        return 0
+
+    if mode == "parallel" and len(tasks) > 1:
+        with Pool(
+            processes=nproc,
+            maxtasksperchild=max_tasks,
+            initializer=_pool_init,
+            initargs=(str(config_path.resolve()),),
+        ) as pool:
+            results = pool.map(_pool_process, tasks, chunksize=1)
+    else:
+        eng = ObsidianMasterEngine(cfg)
+        for inp, outd in tasks:
+            try:
+                r = eng.process_file(Path(inp), Path(outd))
+                results.append(
+                    {
+                        "ok": r.ok,
+                        "source": r.source,
+                        "message": r.message,
+                        "duration_s": r.duration_s,
+                        "outputs": r.outputs,
+                        "sha256": r.sha256,
+                        "warnings": r.warnings,
+                    }
+                )
+            except Exception as e:
+                logging.exception("Sequential worker failed for %s", inp)
+                h = ""
+                try:
+                    h = file_sha256(Path(inp))
+                except OSError:
+                    pass
+                results.append(
+                    {
+                        "ok": False,
+                        "source": Path(inp).name,
+                        "message": f"{type(e).__name__}: {e}",
+                        "duration_s": 0.0,
+                        "outputs": [],
+                        "sha256": h,
+                        "warnings": [],
+                    }
+                )
+
+    for r in results:
+        h = r.get("sha256", "")
+        if r.get("ok"):
+            cache[h] = {
+                "status": "success",
+                "file": r["source"],
+                "time": r["duration_s"],
+                "outputs": r.get("outputs", []),
+                "warnings": r.get("warnings", []),
+            }
+        else:
+            cache[h] = {
+                "status": "failed",
+                "file": r["source"],
+                "error": r.get("message", ""),
+            }
+            append_error_csv(
+                err_file,
+                {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "file": r["source"],
+                    "error": r.get("message", ""),
+                    "sha256": h,
+                },
+            )
+
+    save_process_log(log_file, cache)
+    failed = sum(1 for r in results if not r.get("ok"))
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# GUI (optional)
+# ---------------------------------------------------------------------------
+
+
+def run_gui(config_path: Path) -> None:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    cfg = load_config(config_path)
+    eng = ObsidianMasterEngine(cfg)
+
+    root = tk.Tk()
+    root.title("Obsidian Designer Engine")
+
+    src = tk.StringVar()
+    dst = tk.StringVar()
+
+    frm = ttk.Frame(root, padding=12)
+    frm.pack(fill="both", expand=True)
+
+    ttk.Label(frm, text="Source folder:").grid(row=0, column=0, sticky="w")
+    ttk.Entry(frm, textvariable=src, width=48).grid(row=0, column=1)
+    ttk.Button(
+        frm,
+        text="Browse",
+        command=lambda: src.set(filedialog.askdirectory() or src.get()),
+    ).grid(row=0, column=2)
+
+    ttk.Label(frm, text="Output vault folder:").grid(row=1, column=0, sticky="w")
+    ttk.Entry(frm, textvariable=dst, width=48).grid(row=1, column=1)
+    ttk.Button(
+        frm,
+        text="Browse",
+        command=lambda: dst.set(filedialog.askdirectory() or dst.get()),
+    ).grid(row=1, column=2)
+
+    pb = ttk.Progressbar(frm, length=420, mode="determinate")
+    pb.grid(row=2, column=0, columnspan=3, pady=12)
+
+    def on_run() -> None:
+        s, d = src.get().strip(), dst.get().strip()
+        if not s or not d:
+            messagebox.showerror("Error", "Select source and output folders.")
+            return
+        files = iter_input_files(Path(s))
+        pb["maximum"] = max(1, len(files))
+        pb["value"] = 0
+        for i, f in enumerate(files, start=1):
+            r = eng.process_file(f, Path(d))
+            if not r.ok:
+                messagebox.showerror("Error", f"{r.source}: {r.message}")
+                return
+            pb["value"] = i
+            root.update_idletasks()
+        messagebox.showinfo("Done", "Batch complete.")
+
+    ttk.Button(frm, text="Run", command=on_run).grid(row=3, column=1, pady=8)
+
+    root.mainloop()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config", type=Path, default=Path("config.json"))
+    ap.add_argument("--input", type=Path, help="Input folder (documents)")
+    ap.add_argument("--output", type=Path, help="Obsidian vault output folder")
+    ap.add_argument("--gui", action="store_true", help="Tkinter UI")
+    ap.add_argument(
+        "--no-skip",
+        action="store_true",
+        help="Reprocess all files even if process_log.json marks success for that hash",
+    )
+    ap.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Include supported files in subfolders (rglob)",
+    )
+    args = ap.parse_args()
+
+    if args.gui:
+        run_gui(args.config)
+        return
+
+    if not args.input or not args.output:
+        ap.error("--input and --output are required unless --gui")
+
+    raise SystemExit(
+        run_batch(
+            args.config,
+            args.input,
+            args.output,
+            no_skip=args.no_skip,
+            recursive=args.recursive,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
